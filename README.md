@@ -88,6 +88,11 @@ For automated running, add to crontab:
 0 3 * * * /path/to/varnish-warmer.sh
 ```
 
+```bash
+# Run daily at 3 AM
+0 3 * * * /path/to/varnish-warmer.sh >> /var/log/varnish-warmer.log 2>&1
+```
+
 ## Log Output
 
 The script creates a detailed log file with timestamps:
