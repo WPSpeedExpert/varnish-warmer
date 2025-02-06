@@ -4,16 +4,17 @@
 # Description:      A script to warm Varnish cache by crawling sitemap URLs
 #                   with rate limiting to prevent server overload
 # Author:           WP Speed Expert
-# Version:          1.0.0
+# Version:          1.3.0
 # Compatibility:    Linux with curl, xmllint
 # Requirements:     curl, xmllint, bc
 # GitHub URI:       https://github.com/WPSpeedExpert/varnish-warmer
+# Cron example:     0 3 * * * /home/onsalenow-grafana/varnish-warmer.sh >> /home/onsalenow-grafana/varnish-warmer.log 2>&1
 # ==============================================================================
 
 # Configuration
 SITEMAP_URL="https://yourdomain.com/sitemap.xml"
-REQUESTS_PER_SECOND=2        # How many requests to make per second
-CONCURRENT_REQUESTS=4        # How many concurrent requests to run
+REQUESTS_PER_SECOND=4        # How many requests to make per second
+CONCURRENT_REQUESTS=8        # How many concurrent requests to run
 USER_AGENT="Varnish-Warmer/1.0 (Cache Warming Bot)"
 LOG_FILE="varnish-warming.log"
 TEMP_DIR="/tmp/varnish-warmer"
@@ -44,25 +45,101 @@ check_requirements() {
     fi
 }
 
+# Function to handle XML namespace-aware URL extraction
+extract_urls() {
+    local xml_file="$1"
+    local xpath_query="$2"
+    
+    # Extract URLs and ensure they start with http:// or https://
+    xmllint --xpath "//*[local-name()='${xpath_query}']/*[local-name()='loc']/text()" "${xml_file}" 2>/dev/null | \
+    tr ' ' '\n' | \
+    grep -E '^https?://'
+}
+
+# Function to process a single sitemap file
+process_sitemap() {
+    local sitemap_url="$1"
+    local output_file="$2"
+    local temp_file="${TEMP_DIR}/temp_sitemap_$$.xml"
+
+    log_message "Processing sitemap: ${sitemap_url}"
+    
+    # Download sitemap with retry mechanism
+    local max_retries=3
+    local retry_count=0
+    local download_success=false
+
+    while [ $retry_count -lt $max_retries ] && [ "$download_success" = false ]; do
+        if curl -s -A "${USER_AGENT}" -o "${temp_file}" "${sitemap_url}"; then
+            download_success=true
+        else
+            retry_count=$((retry_count + 1))
+            log_message "WARNING: Failed to download sitemap (attempt ${retry_count}/${max_retries})"
+            sleep 2
+        fi
+    done
+
+    if [ "$download_success" = false ]; then
+        log_message "ERROR: Failed to download sitemap after ${max_retries} attempts: ${sitemap_url}"
+        return 1
+    fi
+
+    # Extract URLs and append to output file
+    extract_urls "${temp_file}" "url" >> "${output_file}"
+    
+    local url_count=$(grep -c . "${output_file}")
+    log_message "Found ${url_count} URLs in this sitemap"
+    
+    # Clean up temp file
+    rm -f "${temp_file}"
+}
+
 # Function to download and parse sitemap
 get_urls_from_sitemap() {
     local sitemap_url="$1"
-    local temp_file="${TEMP_DIR}/sitemap.xml"
+    local temp_file="${TEMP_DIR}/main_sitemap_$$.xml"
+    local urls_file="${TEMP_DIR}/urls.txt"
 
-    log_message "Downloading sitemap from ${sitemap_url}"
+    log_message "Downloading main sitemap from ${sitemap_url}"
     
-    # Download sitemap
+    # Download main sitemap
     if ! curl -s -A "${USER_AGENT}" -o "${temp_file}" "${sitemap_url}"; then
-        log_message "ERROR: Failed to download sitemap"
+        log_message "ERROR: Failed to download main sitemap"
         exit 1
     fi
 
-    # Extract URLs from sitemap
-    xmllint --xpath "//xmlns:loc/text()" "${temp_file}" 2>/dev/null | tr ' ' '\n' > "${TEMP_DIR}/urls.txt"
+    # Initialize urls file
+    > "${urls_file}"
+
+    # Check if this is a sitemap index
+    if grep -q "<sitemapindex" "${temp_file}"; then
+        log_message "Found sitemap index, processing multiple sitemaps..."
+        
+        # Extract and process each sitemap URL
+        extract_urls "${temp_file}" "sitemap" | while read -r sub_sitemap; do
+            process_sitemap "${sub_sitemap}" "${urls_file}"
+            sleep 1  # Brief pause between sitemap processing
+        done
+    else
+        log_message "Processing single sitemap..."
+        process_sitemap "${sitemap_url}" "${urls_file}"
+    fi
+
+    # Ensure we have URLs
+    if [ ! -s "${urls_file}" ]; then
+        log_message "ERROR: No URLs found in sitemap"
+        exit 1
+    fi
+
+    # Sort and deduplicate URLs
+    sort -u "${urls_file}" -o "${urls_file}"
     
     # Count URLs
-    local url_count=$(wc -l < "${TEMP_DIR}/urls.txt")
-    log_message "Found ${url_count} URLs in sitemap"
+    local url_count=$(wc -l < "${urls_file}")
+    log_message "Found ${url_count} unique URLs in total"
+
+    # Clean up main sitemap file
+    rm -f "${temp_file}"
 }
 
 # Function to warm a single URL
@@ -93,6 +170,8 @@ warm_cache() {
     local delay=$(bc <<< "scale=3; 1/${REQUESTS_PER_SECOND}")
     local total_urls=$(wc -l < "${TEMP_DIR}/urls.txt")
     local processed=0
+    local success_count=0
+    local failed_count=0
 
     log_message "Starting cache warming with ${REQUESTS_PER_SECOND} req/s (${delay}s delay)"
     log_message "Processing ${total_urls} URLs..."
@@ -121,8 +200,23 @@ warm_cache() {
     # Wait for remaining background jobs to finish
     wait
 
-    log_message "Cache warming completed. Processed ${processed} URLs."
+    # Calculate success rate
+    success_count=$(grep -c "SUCCESS:" "${LOG_FILE}")
+    failed_count=$(grep -c "FAILED:" "${LOG_FILE}")
+    
+    log_message "Cache warming completed. Summary:"
+    log_message "Total processed: ${processed}"
+    log_message "Successful: ${success_count}"
+    log_message "Failed: ${failed_count}"
 }
+
+# Trap for cleanup on script exit
+cleanup() {
+    log_message "Cleaning up temporary files..."
+    rm -rf "${TEMP_DIR}"
+    log_message "Cleanup completed"
+}
+trap cleanup EXIT
 
 # Main execution
 main() {
@@ -136,9 +230,6 @@ main() {
     
     # Warm the cache
     warm_cache
-    
-    # Cleanup
-    rm -rf "${TEMP_DIR}"
     
     log_message "Process completed successfully"
 }
